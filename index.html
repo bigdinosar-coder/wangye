@@ -550,8 +550,10 @@ function load(){
   if(d.ai.ocr===undefined)d.ai.ocr=true;
   d.tasks.forEach(function(t){
     if(!t.custom)t.custom={};
-     if(!t.profile)t.profile={pts:"",params:"",note:"",audience:"",scene:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[]};
-     ["audience","scene","priceBand","sku","brand","category","certs","faq","history"].forEach(function(k){if(t.profile[k]===undefined)t.profile[k]=""});
+     if(!t.profile)t.profile={pts:"",params:"",note:"",audience:"",scene:"",service:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[],rawOcr:"",structured:null};
+     if(t.profile.rawOcr===undefined)t.profile.rawOcr="";
+     if(t.profile.structured===undefined)t.profile.structured=null;
+     ["audience","scene","service","priceBand","sku","brand","category","certs","faq","history"].forEach(function(k){if(t.profile[k]===undefined)t.profile[k]=""});
      if(!Array.isArray(t.keywords))t.keywords=[];
      if(t.profile&&(t.profile.pts||t.profile.params||t.profile.note||t.profile.imgs&&t.profile.imgs.length))refreshProjectKnowledge(t);
      if(!t.finalPicked||!t.finalPicked.length)t.finalPicked=allFinalIdx();
@@ -1300,7 +1302,7 @@ function imgName(ref,i){
 }
 function imgCount(t){return ((t&&t.profile&&t.profile.imgs)||[]).length}
 /* 记录总张数（不占 localStorage，仅图片计数） */
-function profileFilled(t){var p=t&&t.profile;return !!(p&&(p.pts||p.params||p.note||p.audience||p.scene||p.priceBand||p.sku||p.brand||p.certs||p.faq||p.history||(p.imgs&&p.imgs.length)))}
+function profileFilled(t){var p=t&&t.profile;return !!(p&&(p.pts||p.params||p.note||p.audience||p.scene||p.service||p.priceBand||p.sku||p.brand||p.certs||p.faq||p.history||(p.imgs&&p.imgs.length)))}
 /* ---------- 图片尺寸处理（仅用于接口/OCR 提速与回退存储，不影响原图） ---------- */
 function shrinkImg(file,maxW,quality){
   maxW=maxW||1600;quality=quality||.82;
@@ -1368,9 +1370,10 @@ function aiEndpoint(u){
   if(!/chat\/completions$/.test(u))u+="/chat/completions";
   return u;
 }
-var REC_PROMPT="你是一名电商商品信息提取专家。请仔细阅读下面的商品详情页图片，提取商品信息，并严格只输出一个 JSON（不要任何解释文字）：\n{\"pts\":[\"核心卖点，每条不超过18字，最多6条，突出差异化\"],\"params\":[\"关键参数，格式如 功率 2200W / 容量 1.2L，最多8条\"],\"audience\":\"适用人群与使用场景，一句话\",\"scene\":\"使用场景关键词，逗号分隔\",\"keywords\":\"搜索关键词，逗号分隔，最多10个\"}";
+var REC_PROMPT="你是电商商品档案整理专家。下面是 OCR 识别详情页得到的原始文本，里面可能有乱码、碎片文字、OCR 错字和截断短语。请清洗、纠错并提取有效信息，只能使用原文能确认的事实，不要编造不存在的参数、功能、认证或售后承诺。\n\n输出严格为一个 JSON，不要解释文字：\n{\"pts\":[\"核心卖点，简短通顺，每条不超过24字，最多8条\"],\"params\":[\"核心参数，使用“参数名：参数值”，最多12条\"],\"audience\":\"适用人群，无法确认则为空\",\"scene\":\"功能与适用场景，无法确认则为空\",\"service\":\"质保、售后、配送等服务信息，无法确认则为空\",\"keywords\":\"原文明确出现的搜索词，逗号分隔，无法确认则为空\"}\n\n清洗规则：丢弃乱码和无意义碎片；修正明显 OCR 错字；不要把半截句子当卖点；参数必须保留单位；不确定的信息留空。";
+function cleanProfilePrompt(raw){return REC_PROMPT+"\n\n【原始 OCR 文本】\n"+String(raw||"").slice(0,60000)}
 function parseRecJson(txt){
-  var o={pts:[],params:[],audience:"",scene:"",keywords:""};
+  var o={pts:[],params:[],audience:"",scene:"",service:"",keywords:""};
   var m=String(txt||"").match(/\{[\s\S]*\}/);
   if(m){
     try{
@@ -1379,6 +1382,7 @@ function parseRecJson(txt){
       o.params=(j.params||j.参数||[]).map(String);
       o.audience=j.audience||j.audiences||j.人群||"";
       o.scene=j.scene||j.场景||"";
+      o.service=j.service||j.services||j.服务||j.售后||"";
       o.keywords=Array.isArray(j.keywords)?j.keywords.join("、"):(j.keywords||"");
       return o;
     }catch(e){}
@@ -1409,8 +1413,21 @@ function parseRecJson(txt){
     else if(mode==="kw")o.keywords=(o.keywords?o.keywords+"、":"")+t;
     else push(o.pts,t);
   });
-  o.pts=o.pts.slice(0,10);o.params=o.params.slice(0,10);
+  o.pts=o.pts.slice(0,8);o.params=o.params.slice(0,12);
   return o;
+}
+function aiCleanText(raw){
+  var cfg=aiCfg(),ep=aiEndpoint(cfg.url);
+  if(!ep||!cfg.key)return Promise.reject(new Error("no-cfg"));
+  var body={model:cfg.model||"qwen-plus",messages:[{role:"user",content:cleanProfilePrompt(raw)}],temperature:0.1};
+  return fetch(ep,{method:"POST",headers:{"Content-Type":"application/json","Authorization":"Bearer "+cfg.key},body:JSON.stringify(body)})
+    .then(function(r){return r.json().catch(function(){throw new Error("接口返回异常（HTTP "+r.status+"）")})})
+    .then(function(j){
+      var txt="";try{txt=j.choices[0].message.content}catch(e){}
+      if(Array.isArray(txt))txt=txt.map(function(x){return x.text||""}).join("");
+      if(!txt)throw new Error((j.error&&(j.error.message||j.error.code))||"接口未返回内容");
+      var out=parseRecJson(txt);out.rawText=String(raw||"");out.engine="ai-clean";return out;
+    });
 }
 function aiVision(urls){
   var cfg=aiCfg(),ep=aiEndpoint(cfg.url);
@@ -1479,45 +1496,29 @@ function recognizeProfile(t,status){
     all=all.filter(Boolean);
     if(!all.length)throw new Error("图片读取失败，请重新上传");
     var cfg=aiCfg();
-    if(cfg.url&&cfg.key){
-      var small=[],chain=Promise.resolve();
-      all.forEach(function(u){chain=chain.then(function(){return shrinkDataUrl(u,1280,.82).then(function(x){small.push(x||u)})})});
-      return chain.then(function(){
-        var batches=[],k=0;
-        while(k<small.length){batches.push(small.slice(k,k+4));k+=4}
-        var res={pts:[],params:[],audience:"",scene:"",keywords:"",engine:"ai"};
-        var c2=Promise.resolve();
-        batches.forEach(function(b,bi){
-          c2=c2.then(function(){
-            if(status)status("AI 视觉识别中（第 "+(bi+1)+"/"+batches.length+" 批 · 共 "+small.length+" 张）…",true);
-            return aiVision(b).then(function(r){
-              (r.pts||[]).forEach(function(x){if(x&&res.pts.indexOf(x)<0)res.pts.push(x)});
-              (r.params||[]).forEach(function(x){if(x&&res.params.indexOf(x)<0)res.params.push(x)});
-              if(r.audience&&!res.audience)res.audience=r.audience;
-              if(r.scene&&!res.scene)res.scene=r.scene;
-              if(r.keywords&&!res.keywords)res.keywords=r.keywords;
-            });
-          });
+    if(cfg.ocr===false&&!cfg.key)throw new Error("已关闭本地 OCR，且未配置 AI 接口");
+    var tiles=[],tileChain=Promise.resolve();
+    all.forEach(function(u){tileChain=tileChain.then(function(){return prepOcrTiles(u,1600,1800).then(function(xs){tiles=tiles.concat(xs)})})});
+    return tileChain.then(function(){return ocrImages(tiles,status)}).then(function(raw){
+      raw=String(raw||"").trim();
+      if(!raw)throw new Error("OCR 未提取到原始文字，请上传更清晰的详情页图片");
+      var base={pts:[],params:[],audience:"",scene:"",service:"",keywords:"",rawOcr:raw,engine:"ocr"};
+      if(cfg.url&&cfg.key){
+        if(status)status("AI 正在清洗 OCR 原文并整理商品档案…",true);
+        return aiCleanText(raw).then(function(r){
+          r.rawOcr=raw;r.engine="ai-clean";return r;
+        }).catch(function(){
+          base.aiError="AI 清洗失败，已保留原始 OCR 文本";return base;
         });
-        return c2.then(function(){
-          res.pts=res.pts.slice(0,12);res.params=res.params.slice(0,12);
-          return res;
-        });
-      });
-    }
-    if(cfg.ocr===false)throw new Error("未配置 AI 接口，且已关闭本地 OCR");
-    var fast=[],ch2=Promise.resolve();
-    all.forEach(function(u){ch2=ch2.then(function(){return shrinkDataUrl(u,1600,.85).then(function(x){fast.push(x||u)})})});
-    return ch2.then(function(){return ocrImages(fast,status)}).then(function(txt){
-      var r=ocrParse(txt);r.engine="ocr";
-      if(!r.pts.length&&!r.params.length)throw new Error("OCR 未提取到有效文字，建议配置 AI 接口或换更清晰的详情页图");
-      return r;
+      }
+      base.aiError="未配置 AI 接口，暂不把 OCR 碎片填入档案";
+      return base;
     });
   });
 }
 function showProfile(t){
-  if(!t.profile)t.profile={pts:"",params:"",note:"",audience:"",scene:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[]};
-  ["audience","scene","priceBand","sku","brand","category","certs","faq","history"].forEach(function(k){if(t.profile[k]===undefined)t.profile[k]=""});
+  if(!t.profile)t.profile={pts:"",params:"",note:"",audience:"",scene:"",service:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[],rawOcr:"",structured:null};
+  ["audience","scene","service","priceBand","sku","brand","category","certs","faq","history"].forEach(function(k){if(t.profile[k]===undefined)t.profile[k]=""});
   if(!Array.isArray(t.profile.imgs))t.profile.imgs=[];
   var p=t.profile,objUrls=[];
   function revoke(){objUrls.forEach(function(u){try{URL.revokeObjectURL(u)}catch(e){}});objUrls=[]}
@@ -1537,12 +1538,13 @@ function showProfile(t){
     '<div style="margin-top:12px"><label>人群 / 场景 / 价格带</label><input id="pfNote" value="'+esc(p.note||"")+'" placeholder="例：租房党 / 一人食 / 200-300元档"></div>'+ 
     '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px"><div><label>目标人群</label><input id="pfAudience" value="'+esc(p.audience||"")+'" placeholder="例：年轻租房用户"></div><div><label>使用场景</label><input id="pfScene" value="'+esc(p.scene||"")+'" placeholder="例：早餐、露营、办公室"></div></div>'+ 
     '<div style="margin-top:12px"><label>证书 / 资质 / 合规限制</label><textarea id="pfCerts" rows="3" placeholder="例：3C；食品接触材质；不可宣称医疗功效">'+esc(p.certs||"")+'</textarea></div>'+ 
+    '<div style="margin-top:12px"><label>服务信息（质保 / 售后 / 配送）</label><textarea id="pfService" rows="3" placeholder="只填写详情页明确出现的质保、售后、配送信息">'+esc(p.service||"")+'</textarea></div>'+ 
     '<div style="margin-top:12px"><label>历史用户问题 / 售后问题</label><textarea id="pfFaq" rows="3" placeholder="把已有客服、评价、售后问题粘贴进来">'+esc(p.faq||"")+'</textarea></div>'+ 
     '<div style="margin-top:12px"><label>历史运营经验</label><textarea id="pfHistory" rows="3" placeholder="哪些卖点常用、哪些任务容易阻塞、哪些内容最终被采用">'+esc(p.history||"")+'</textarea></div></div>'+ 
     '</div>'+ 
     '<div style="margin-top:12px;border-top:1px dashed var(--line);padding-top:10px">'+
     '<label style="font-weight:800">🔍 一键识别 · 读取详情页内容自动填充档案</label>'+
-    '<div class="muted" style="margin-top:4px;line-height:1.75">上传图片后点「一键识别并填充」，系统读取详情页画面里的卖点、参数、人群场景，识别结果逐条列在下方，点一下就填进上面的档案（也可一键全部采纳）。</div>'+
+    '<div class="muted" style="margin-top:4px;line-height:1.75">上传图片后点「一键识别并填充」：先对长图切片并进行 OCR，原始文本只用于溯源；配置 AI 后，系统再按卖点、参数、功能场景、服务信息四类清洗，避免生成零散乱码候选。</div>'+ 
     '<div style="display:flex;gap:12px;margin-top:16px;flex-wrap:wrap;align-items:center">'+
     '<button class="primary small" id="pfRec">🔍 一键识别并填充</button>'+
     '<button class="small" id="pfCfg">⚙️ AI 接口设置</button>'+
@@ -1550,14 +1552,14 @@ function showProfile(t){
     '<span class="muted" id="pfRecStatus" style="font-size:14.5px"></span></div>'+
     '<div id="pfCfgBox" class="rbox" style="display:none">'+
     '<div class="r-h">AI 视觉接口（OpenAI 兼容 · 选填）</div>'+
-    '<div class="muted" style="line-height:1.75;margin-bottom:6px">填了就走真实 AI 视觉识别（推荐通义千问 <b>qwen-vl-plus</b> / 智谱 <b>glm-4v</b> 等 OpenAI 兼容地址）；不填则自动用<b>本地 OCR</b>免费识别。密钥只保存在你自己这台设备上。</div>'+
+    '<div class="muted" style="line-height:1.75;margin-bottom:6px">系统固定先做本地 OCR，再把 OCR 原文交给文本模型清洗（推荐通义千问 <b>qwen-plus</b>；也可使用兼容接口）。不填接口时只保存 OCR 原文，不会直接生成碎片候选。密钥只保存在你自己这台设备上。</div>'+ 
     '<input id="pfCfgUrl" placeholder="例：https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions">'+
     '<input id="pfCfgKey" type="password" placeholder="API Key（sk-…）" style="margin-top:6px">'+
     '<input id="pfCfgModel" placeholder="模型名，例：qwen-vl-plus" style="margin-top:6px">'+
     '<label style="display:flex;gap:10px;align-items:center;margin-top:14px"><input type="checkbox" id="pfCfgAuto" style="width:auto"> 上传图片后自动识别（仅配置接口时生效）</label>'+
     '<div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap"><button class="small primary" id="pfCfgSave">保存接口设置</button>'+
     '<button class="small" id="pfCfgClose">收起</button><span class="muted" style="align-self:center;font-size:14.5px">接口不支持浏览器直连时，改用本地 OCR 或下方提示词路径</span></div></div>'+
-    '<div id="pfRecOut"></div>'+
+    '<div id="pfRecOut"></div>'+ 
     '</div>'+
     '<div style="margin-top:12px;border-top:1px dashed var(--line);padding-top:10px">'+
     '<label style="font-weight:800">🤖 外部 AI 解析提示词（兜底路径）</label>'+
@@ -1590,6 +1592,7 @@ function showProfile(t){
     t.profile.audience=document.getElementById("pfAudience").value.trim();
     t.profile.scene=document.getElementById("pfScene").value.trim();
     t.profile.certs=document.getElementById("pfCerts").value.trim();
+    t.profile.service=document.getElementById("pfService").value.trim();
     t.profile.faq=document.getElementById("pfFaq").value.trim();
     t.profile.history=document.getElementById("pfHistory").value.trim();
     refreshProjectKnowledge(t);
@@ -1653,43 +1656,74 @@ function showProfile(t){
       return '<button class="recchip" data-rec="'+field+'|'+encodeURIComponent(x)+'"><span class="k">+</span>'+esc(x)+'</button>';
     }).join("")+'</div>';
   }
+  function recValueList(v){
+    if(!v)return [];
+    if(Array.isArray(v))return v.filter(Boolean).map(String);
+    return String(v).split(/[\n；;，,]+/).map(function(x){return x.trim()}).filter(Boolean);
+  }
+  function rawOcrHtml(raw){
+    if(!raw)return "";
+    return '<details class="rbox" style="margin-top:12px"><summary style="cursor:pointer;font-weight:800">📄 查看原始 OCR 文本（仅供溯源，不直接填入档案）</summary><pre style="white-space:pre-wrap;max-height:260px;overflow:auto;margin:12px 0 0;line-height:1.7;font:13px/1.7 ui-monospace,Consolas,monospace">'+esc(raw)+'</pre></details>';
+  }
   function renderRec(res){
     var box=document.getElementById("pfRecOut");if(!box)return;
-    var has=(res.pts||[]).length+(res.params||[]).length;
-    if(!has){
-      box.innerHTML='<div class="rbox"><div class="r-h">没有识别出可用内容</div><div class="muted" style="line-height:1.8">可能是图片文字太少、识别引擎未加载成功或接口不可用。可改用下方「生成详情页解析提示词」的外部 AI 路径，或在「AI 接口设置」里配置一个支持看图的接口。</div></div>';
-      return;
+    res=res||{};
+    var pts=recValueList(res.pts),params=recValueList(res.params),aud=recValueList(res.audience),scene=recValueList(res.scene),service=recValueList(res.service),kw=recValueList(res.keywords);
+    var has=pts.length+params.length+aud.length+scene.length+service.length+kw.length;
+    var source=res.engine==="ai-clean"?"AI 清洗结构化":(res.engine==="ocr-raw"?"原始 OCR":"本地 OCR");
+    var structured=has>0&&res.engine!=="ocr-raw";
+    var h='<div class="rbox"><div class="r-h">'+(structured?"🧠 AI 整理后的结构化档案":"📄 OCR 原文已保存，尚未生成结构化档案")+'<span class="muted" style="font-weight:600;font-size:14.5px;margin-left:auto">来源：'+source+'</span></div>';
+    if(structured){
+      h+='<div class="muted" style="line-height:1.75;margin-top:4px">以下内容来自 OCR 原文清洗，点击条目可填入商品档案；请人工确认后再保存。</div>';
+      h+=(pts.length?'<div style="font-weight:700;font-size:14.5px;color:var(--sub);margin-top:12px">核心卖点</div>'+recChips(pts,"pts"):"");
+      h+=(params.length?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">核心参数</div>'+recChips(params,"params"):"");
+      h+=(aud.length?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">适用人群</div>'+recChips(aud,"audience"):"");
+      h+=(scene.length?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">功能 / 场景</div>'+recChips(scene,"scene"):"");
+      h+=(service.length?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">服务信息</div>'+recChips(service,"service"):"");
+      h+=(kw.length?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">关键词</div>'+recChips(kw,"keywords"):"");
+      h+='<div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap"><button class="small primary" id="pfRecAll">全部采纳并保存</button><button class="small" id="pfRecFix">✨ AI 重新纠错</button><button class="small" id="pfRecCopy">复制结构化结果</button></div>';
+    }else{
+      h+='<div class="muted" style="line-height:1.8;margin-top:8px">OCR 原文不会再被自动切成碎片标签。请先在「AI 接口设置」配置文本模型，再点击「✨ AI 重新纠错」，由 AI 按卖点 / 参数 / 场景 / 服务四类整理。</div><div style="margin-top:14px"><button class="small primary" id="pfRecFix">✨ AI 清洗 OCR 原文</button><button class="small" id="pfRecCopy">复制原始 OCR</button></div>';
     }
-    box.innerHTML='<div class="rbox"><div class="r-h">识别结果 · '+(has)+' 条候选（点击即填入档案）'+
-      '<span class="muted" style="font-weight:600;font-size:14.5px;margin-left:auto">来源：'+(res.engine==="ai"?"AI 视觉接口":"本地 OCR")+'</span></div>'+
-      ((res.pts||[]).length?'<div style="font-weight:700;font-size:14.5px;color:var(--sub);margin-top:4px">核心卖点</div>'+recChips(res.pts,"pts"):"")+
-      ((res.params||[]).length?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">核心参数</div>'+recChips(res.params,"params"):"")+
-      ((res.audience||res.scene||res.keywords)?'<div style="font-weight:700;font-size:15px;color:var(--sub);margin-top:14px">人群 / 场景 / 关键词</div>'+recChips([res.audience,res.scene,res.keywords].filter(Boolean),"note"):"")+
-      '<div style="margin-top:16px;display:flex;gap:12px;flex-wrap:wrap"><button class="small primary" id="pfRecAll">全部采纳并保存</button><button class="small" id="pfRecCopy">复制识别结果</button></div></div>';
+    h+='</div>'+rawOcrHtml(res.rawOcr||p.rawOcr||"");
+    box.innerHTML=h;
     box.querySelectorAll("[data-rec]").forEach(function(el){
       el.onclick=function(e){
         e.stopPropagation();
         var parts=el.dataset.rec.split("|");
-        adoptRec(parts[0],decodeURIComponent(parts.slice(1).join("|")));
+        var val=decodeURIComponent(parts.slice(1).join("|")),field=parts[0];
+        if(field==="audience")document.getElementById("pfAudience").value=val;
+        else if(field==="scene")document.getElementById("pfScene").value=val;
+        else if(field==="service")document.getElementById("pfService").value=val;
+        else if(field==="keywords")document.getElementById("pfNote").value=(document.getElementById("pfNote").value.trim()?document.getElementById("pfNote").value.trim()+"；":"")+val;
+        else adoptRec(field,val);
         el.classList.add("done");sfx.pick();
         toast("已填入档案，记得点「保存档案」");
       };
     });
     var all=document.getElementById("pfRecAll");
     if(all)all.onclick=function(){
-      (res.pts||[]).forEach(function(x){adoptRec("pts",x)});
-      (res.params||[]).forEach(function(x){adoptRec("params",x)});
-      [res.audience,res.scene,res.keywords].filter(Boolean).forEach(function(x){adoptRec("note",x)});
+      pts.forEach(function(x){adoptRec("pts",x)});
+      params.forEach(function(x){adoptRec("params",x)});
+      if(aud.length)document.getElementById("pfAudience").value=aud.join("；");
+      if(scene.length)document.getElementById("pfScene").value=scene.join("；");
+      if(service.length)document.getElementById("pfService").value=service.join("；");
+      if(kw.length)document.getElementById("pfNote").value=(document.getElementById("pfNote").value.trim()?document.getElementById("pfNote").value.trim()+"；":"")+kw.join("、");
       saveProfile();save();sfx.stage();
       box.querySelectorAll("[data-rec]").forEach(function(el){el.classList.add("done")});
       toast("识别结果已全部采纳并保存进档案",true);
     };
     var cp=document.getElementById("pfRecCopy");
     if(cp)cp.onclick=function(){
-      var txt="【商品档案 · "+t.name+"】\n核心卖点：\n"+(res.pts||[]).map(function(x){return "- "+x}).join("\n")+"\n核心参数：\n"+(res.params||[]).map(function(x){return "- "+x}).join("\n");
-      if(res.audience||res.scene)txt+="\n人群/场景："+[res.audience,res.scene].filter(Boolean).join("；");
-      if(res.keywords)txt+="\n关键词："+res.keywords;
+      var txt="【商品档案 · "+t.name+"】\n【核心卖点】\n"+pts.map(function(x){return "- "+x}).join("\n")+"\n【核心参数】\n"+params.map(function(x){return "- "+x}).join("\n")+"\n【功能场景】\n"+scene.concat(aud).map(function(x){return "- "+x}).join("\n")+"\n【服务信息】\n"+service.map(function(x){return "- "+x}).join("\n");
+      if(kw.length)txt+="\n关键词："+kw.join("、");
       toast(copyText(txt)?"识别结果已复制":"复制失败，请手动选择",true);
+    };
+    var fix=document.getElementById("pfRecFix");
+    if(fix)fix.onclick=function(){
+      if(!res.rawOcr&&!p.rawOcr){toast("没有可供纠错的 OCR 原文");return}
+      var raw=res.rawOcr||p.rawOcr;fix.disabled=true;status("AI 正在重新清洗 OCR 原文…",true);
+      aiCleanText(raw).then(function(next){t.profile.rawOcr=raw;t.profile.structured=next;save();renderRec(next);status("AI 纠错完成，请人工确认后保存");toast("AI 已重新整理档案",true)}).catch(function(){toast("AI 接口不可用，请检查接口设置");status("AI 纠错失败")}).then(function(){fix.disabled=false});
     };
   }
   function doRec(){
@@ -1698,10 +1732,13 @@ function showProfile(t){
     if(btn)btn.disabled=true;
     status("准备识别…",true);
     recognizeProfile(t,status).then(function(res){
+      t.profile.rawOcr=res.rawOcr||t.profile.rawOcr||"";
+      t.profile.structured=(res.engine==="ai-clean"?res:null);
+      save();
       renderRec(res);
-      var n=(res.pts||[]).length+(res.params||[]).length;
-      status("识别完成：共 "+n+" 条候选（"+(res.engine==="ai"?"AI 视觉接口":"本地 OCR")+"）");
-      sfx.stage();toast("识别完成，点候选条目即可填入档案",true);
+      var n=(res.pts||[]).length+(res.params||[]).length+(res.service?1:0);
+      status(res.engine==="ai-clean"?"AI 清洗完成：共 "+n+" 条结构化候选":"OCR 完成：原文已保存，等待 AI 清洗");
+      sfx.stage();toast(res.engine==="ai-clean"?"识别完成，请人工确认结构化档案":"OCR 原文已保存，未直接生成碎片候选",true);
     }).catch(function(err){
       var msg=(err&&err.message)||String(err);
       status("识别失败："+msg);
@@ -1714,6 +1751,7 @@ function showProfile(t){
   }
   /* --- 事件绑定 --- */
   thumbs();
+  if(p.rawOcr)renderRec(p.structured||{rawOcr:p.rawOcr,engine:"ocr-raw"});
   var drop=document.getElementById("pfDrop"),inp=document.getElementById("pfImgs"),dlg=document.getElementById("pfDlg");
   drop.onclick=function(){inp.click()};
   inp.onchange=function(e){addFiles(e.target.files);e.target.value=""};
@@ -1752,11 +1790,11 @@ function showProfile(t){
     c.model=document.getElementById("pfCfgModel").value.trim();
     c.auto=document.getElementById("pfCfgAuto").checked;
     save();sfx.pick();
-    toast(c.url&&c.key?"AI 接口已保存：一键识别将走真实视觉识别":"已保存（未填接口，将使用本地 OCR）",true);
-    status(c.url&&c.key?"已配置 AI 视觉接口，点「一键识别并填充」直接识别":"未配置接口，将使用本地 OCR 识别");
+    toast(c.url&&c.key?"AI 接口已保存：OCR 后将自动清洗结构化":"已保存（未填接口，只保留原始 OCR）",true);
+    status(c.url&&c.key?"已配置 AI 清洗接口：识别后会整理为卖点 / 参数 / 场景 / 服务":"未配置接口：不会把 OCR 碎片直接填入档案");
   };
   document.getElementById("pfAsk").onclick=function(){
-    var out="你是一名电商运营专家。以下是商品「"+t.name+"」的详情页图片，请逐张仔细阅读，提取：\n1、主要功能卖点（逐条，突出差异化）\n2、关键参数（型号 / 容量 / 功率 / 材质 / 认证等，逐条）\n3、适用人群与使用场景\n\n输出格式：\n核心卖点：\n- …\n核心参数：\n- …\n适用人群/场景：\n- …";
+    var out=cleanProfilePrompt(p.rawOcr||"")+"\n\n【使用说明】如果没有配置接口，可复制以上提示词，并连同原始详情页图片一起发送给外部 AI；返回结构化结果后再人工粘贴确认。";
     var ta=document.getElementById("pfAskOut");if(ta)ta.value=out;
     sfx.pick();toast("解析提示词已生成，点「📋 复制」后再发给 AI",true);
   };
@@ -2155,8 +2193,9 @@ function profBlock(t){
    if(p.pts)arr.push("核心卖点："+p.pts);
    if(p.params)arr.push("核心参数："+p.params);
    if(p.note)arr.push("补充说明（人群 / 场景 / 价格带）："+p.note);
-  if(p.audience)arr.push("目标人群："+p.audience);
-  if(p.scene)arr.push("使用场景："+p.scene);
+   if(p.audience)arr.push("目标人群："+p.audience);
+   if(p.scene)arr.push("使用场景："+p.scene);
+  if(p.service)arr.push("服务信息："+p.service);
   if(p.certs)arr.push("证书 / 资质 / 合规限制："+p.certs);
   if(p.faq)arr.push("历史用户问题："+p.faq);
   if(p.history)arr.push("历史运营经验："+p.history);
@@ -2291,6 +2330,33 @@ function curTask(){
   if(view.homeTid)t=db.tasks.filter(function(x){return x.id===view.homeTid})[0];
   if(!t&&db.tasks.length)t=db.tasks[0];
   return t;
+}
+function prepOcrTiles(url,maxW,maxH){
+  maxW=maxW||1600;maxH=maxH||1800;
+  return new Promise(function(res){
+    try{
+      var img=new Image();
+      img.onload=function(){
+        try{
+          var sc=Math.min(1,maxW/img.width),outW=Math.max(1,Math.round(img.width*sc));
+          var srcTileH=Math.max(1,Math.floor(maxH/sc)),tiles=[];
+          for(var sy=0;sy<img.height;sy+=srcTileH){
+            var sh=Math.min(srcTileH,img.height-sy),outH=Math.max(1,Math.round(sh*sc));
+            var cv=document.createElement("canvas");cv.width=outW;cv.height=outH;
+            var cx=cv.getContext("2d");cx.fillStyle="#fff";cx.fillRect(0,0,outW,outH);cx.drawImage(img,0,sy,img.width,sh,0,0,outW,outH);
+            try{
+              var im=cx.getImageData(0,0,outW,outH),d=im.data;
+              for(var i=0;i<d.length;i+=4){var g=.299*d[i]+.587*d[i+1]+.114*d[i+2];g=Math.max(0,Math.min(255,(g-128)*1.22+132));d[i]=d[i+1]=d[i+2]=g}
+              cx.putImageData(im,0,0);
+            }catch(e){}
+            tiles.push(cv.toDataURL("image/jpeg",.9));
+          }
+          res(tiles);
+        }catch(e){res([url])}
+      };
+      img.onerror=function(){res([url])};img.src=url;
+    }catch(e){res([url])}
+  });
 }
 function realTasks(){return (db.tasks||[]).filter(function(t){return t&&t.id&&String(t.name||"").trim()})}
 function taskProgress(t){var total=countTotal(t),done=countDone(t);return {total:total,done:done,pct:total?Math.round(done/total*100):0}}
@@ -3075,7 +3141,7 @@ function renderHome(){
   document.getElementById("btnCreate").onclick=function(){
     var name=document.getElementById("npName").value.trim(),date=document.getElementById("npDate").value;
     if(!name){sfx.err();toast("先给商品起个名字");return}
-    var t={id:"t"+Date.now(),name:name,launchDate:date,createdAt:Date.now(),state:{},custom:{},keywords:[],profile:{pts:"",params:"",note:"",audience:"",scene:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[]},finalPicked:allFinalIdx(),finalChosen:true};
+    var t={id:"t"+Date.now(),name:name,launchDate:date,createdAt:Date.now(),state:{},custom:{},keywords:[],profile:{pts:"",params:"",note:"",audience:"",scene:"",service:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[],rawOcr:"",structured:null},finalPicked:allFinalIdx(),finalChosen:true};
     var tplSel=document.getElementById("npTpl");
     if(tplSel&&tplSel.value){
       var tpl=db.templates.filter(function(x){return x.id===tplSel.value})[0];
@@ -3131,8 +3197,8 @@ function renderHome(){
       if(!db.templates)db.templates=[];
       db.tasks.forEach(function(t){
         if(!t.custom)t.custom={};
-         if(!t.profile)t.profile={pts:"",params:"",note:"",audience:"",scene:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[]};
-         ["audience","scene","priceBand","sku","brand","category","certs","faq","history"].forEach(function(k){if(t.profile[k]===undefined)t.profile[k]=""});
+         if(!t.profile)t.profile={pts:"",params:"",note:"",audience:"",scene:"",service:"",priceBand:"",sku:"",brand:"",category:"",certs:"",faq:"",history:"",imgs:[],rawOcr:"",structured:null};
+         ["audience","scene","service","priceBand","sku","brand","category","certs","faq","history"].forEach(function(k){if(t.profile[k]===undefined)t.profile[k]=""});
          if(!Array.isArray(t.keywords))t.keywords=[];
          if(t.profile&&(t.profile.pts||t.profile.params||t.profile.note||t.profile.imgs&&t.profile.imgs.length))refreshProjectKnowledge(t);
          if(!Array.isArray(t.profile.imgs))t.profile.imgs=[];
